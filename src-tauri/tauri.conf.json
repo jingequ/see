@@ -1,0 +1,107 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "See",
+  "version": "0.1.0",
+  "identifier": "com.openai.see",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:1420"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "See",
+        "width": 1440,
+        "height": 900,
+        "minWidth": 640,
+        "minHeight": 480,
+        "resizable": true,
+        "dragDropEnabled": true,
+        "decorations": false,
+        "maximized": true,
+        "zoomHotkeysEnabled": true,
+        "fullscreen": false,
+        "transparent": false
+      }
+    ],
+    "security": {
+      "csp": null,
+      "assetProtocol": {
+        "enable": true,
+        "scope": ["**"]
+      }
+    }
+  },
+  "bundle": {
+    "active": false,
+    "targets": "all",
+    "icon": [],
+    "fileAssociations": [
+      {
+        "ext": ["jpg", "jpeg"],
+        "mimeType": "image/jpeg",
+        "name": "JPEG Image",
+        "description": "JPEG image viewed with See",
+        "role": "Viewer"
+      },
+      {
+        "ext": ["png"],
+        "mimeType": "image/png",
+        "name": "PNG Image",
+        "description": "PNG image viewed with See",
+        "role": "Viewer"
+      },
+      {
+        "ext": ["bmp"],
+        "mimeType": "image/bmp",
+        "name": "Bitmap Image",
+        "description": "Bitmap image viewed with See",
+        "role": "Viewer"
+      },
+      {
+        "ext": ["gif"],
+        "mimeType": "image/gif",
+        "name": "GIF Image",
+        "description": "GIF image viewed with See",
+        "role": "Viewer"
+      },
+      {
+        "ext": ["webp"],
+        "mimeType": "image/webp",
+        "name": "WebP Image",
+        "description": "WebP image viewed with See",
+        "role": "Viewer"
+      },
+      {
+        "ext": ["tif", "tiff"],
+        "mimeType": "image/tiff",
+        "name": "TIFF Image",
+        "description": "TIFF image viewed with See",
+        "role": "Viewer"
+      },
+      {
+        "ext": ["ico"],
+        "mimeType": "image/x-icon",
+        "name": "Icon File",
+        "description": "Icon viewed with See",
+        "role": "Viewer"
+      },
+      {
+        "ext": ["svg"],
+        "mimeType": "image/svg+xml",
+        "name": "SVG Image",
+        "description": "SVG viewed with See",
+        "role": "Viewer"
+      },
+      {
+        "ext": ["heic"],
+        "mimeType": "image/heic",
+        "name": "HEIC Image",
+        "description": "HEIC image viewed with See",
+        "role": "Viewer"
+      }
+    ]
+  }
+}
