@@ -53,18 +53,32 @@ class ViewerApp {
   private pinchCenter: { x: number; y: number } | null = null;
   private appWindow = getCurrentWindow();
   private lastWheelZoomAt = 0;
-  private lastWheelNavigateAt = 0;
+  private lastWheelNavTime = 0;
   private lastWheelDebugAt = 0;
+  private wheelAccumulatorY = 0;
+  private wheelResetTimer: number | null = null;
   private lastPointerPoint: { x: number; y: number } | null = null;
+  private isPanningImage = false;
+  private panStartPoint = { x: 0, y: 0 };
+  private panBaseOffset = { x: 0, y: 0 };
   private dragPointerId: number | null = null;
   private dragStartPoint: { x: number; y: number } | null = null;
   private dragTriggered = false;
   private imageFallbacks = new Set<string>();
-  private stripLoadedCount = 0;
+  private stripObserver: IntersectionObserver | null = null;
+  private stripLoadQueue: number[] = [];
+  private stripActiveLoads = 0;
+  private maxConcurrentStripLoads = 4;
   private stripWidthPercent = 100;
   private isPresentationMode = false;
   private panX = 0;
   private panY = 0;
+  private contextMenuElement: HTMLDivElement | null = null;
+  private contextMenuTarget: string | null = null;
+  private statusNotice: string | null = null;
+  private statusNoticeTimer: number | null = null;
+  private toastElement: HTMLDivElement | null = null;
+  private toastTimer: number | null = null;
 
   async init() {
     this.renderShell();
@@ -86,7 +100,6 @@ class ViewerApp {
         this.payload.images.findIndex((path) => path === this.payload?.currentPath)
       );
 
-      this.stripLoadedCount = this.getInitialStripLoadedCount();
       await this.renderSingleView(true);
       this.preloadNearby();
     } catch (error) {
@@ -121,7 +134,7 @@ class ViewerApp {
         <header class="topbar">
           <div class="topbar__drag" id="drag-surface">
             <div class="topbar__meta">
-              <span class="topbar__title">See</span>
+              <span class="topbar__title">See <span class="topbar__badge">v0.2.0 新版</span></span>
               <span class="topbar__path" id="current-path"></span>
             </div>
           </div>
@@ -263,6 +276,10 @@ class ViewerApp {
 
       if (event.key === "Escape") {
         event.preventDefault();
+        if (this.isContextMenuOpen()) {
+          this.closeContextMenu();
+          return;
+        }
         if (this.isPresentationMode) {
           void this.toggleFullscreen();
         } else if (this.mode === "strip" && this.payload?.images.length) {
@@ -278,6 +295,16 @@ class ViewerApp {
         return;
       }
 
+      if (event.key === "Delete") {
+        event.preventDefault();
+        this.closeContextMenu();
+        const current = this.currentPath();
+        if (current) {
+          void this.deleteImage(current, event.shiftKey);
+        }
+        return;
+      }
+
       if (event.key === STRIP_TOGGLE_KEY) {
         event.preventDefault();
         void this.toggleMode();
@@ -285,12 +312,18 @@ class ViewerApp {
       }
 
       if (this.mode === "single") {
-        if (event.key === "ArrowLeft") {
+        if (event.key === "ArrowLeft" || event.key === "ArrowUp" || event.key === "PageUp") {
           event.preventDefault();
-          void this.goToIndex(this.currentIndex - 1);
-        } else if (event.key === "ArrowRight") {
+          void this.stepSingleImage(-1);
+        } else if (event.key === "ArrowRight" || event.key === "ArrowDown" || event.key === "PageDown" || event.key === " ") {
           event.preventDefault();
-          void this.goToIndex(this.currentIndex + 1);
+          void this.stepSingleImage(1);
+        } else if (event.key === "Home") {
+          event.preventDefault();
+          void this.goToIndex(0);
+        } else if (event.key === "End") {
+          event.preventDefault();
+          void this.goToIndex((this.payload?.images.length ?? 1) - 1);
         } else if (event.key === "0") {
           event.preventDefault();
           this.resetSingleScaleToLongSide();
@@ -307,19 +340,44 @@ class ViewerApp {
     window.addEventListener(
       "wheel",
       (event) => {
-        if (this.mode !== "single") {
+        this.closeContextMenu();
+
+        if (event.ctrlKey || event.metaKey) {
+          if (this.mode === "single") {
+            event.preventDefault();
+            this.applyWheelZoom(event);
+          }
           return;
         }
 
-        if (!event.ctrlKey && !event.metaKey) {
-          return;
+        if (this.mode === "single") {
+          event.preventDefault();
+          this.handleSingleWheelNavigate(event);
         }
-
-        event.preventDefault();
-        this.applyWheelZoom(event);
       },
-      { passive: false, capture: true }
+      { passive: false }
     );
+
+    window.addEventListener("contextmenu", (event) => {
+      event.preventDefault();
+      this.handleContextMenu(event);
+    });
+
+    window.addEventListener(
+      "pointerdown",
+      (event) => {
+        if (event.button === 2) {
+          // 右键点击由 contextmenu 事件处理，不在这里关闭
+          return;
+        }
+        if (this.contextMenuElement && !this.contextMenuElement.contains(event.target as Node)) {
+          this.closeContextMenu();
+        }
+      },
+      { capture: true }
+    );
+
+    window.addEventListener("resize", this.closeContextMenu);
 
     void this.appWindow.onResized(() => {
       void this.refreshWindowChrome();
@@ -335,6 +393,7 @@ class ViewerApp {
   }
 
   private async openPath(path: string) {
+    this.closeContextMenu();
     try {
       const normalizedPath = this.normalizeInputPath(path);
       if (!normalizedPath) {
@@ -356,7 +415,6 @@ class ViewerApp {
         this.payload.images.findIndex((item) => item === this.payload?.currentPath)
       );
       this.mode = "single";
-      this.stripLoadedCount = this.getInitialStripLoadedCount();
       this.cache.clear();
       this.renderedStrip.clear();
       this.loadingStrip.clear();
@@ -368,24 +426,131 @@ class ViewerApp {
     }
   }
 
+  private isTempOrArchiveImage(path: string | null): boolean {
+    if (!path) return false;
+    const lower = path.toLowerCase();
+    return (
+      lower.includes("\\temp\\") ||
+      lower.includes("/temp/") ||
+      lower.includes(".zip.") ||
+      lower.includes(".rar.") ||
+      lower.includes(".7z.") ||
+      lower.includes("zipmaster")
+    );
+  }
+
   private async toggleMode() {
+    this.closeContextMenu();
     this.mode = this.mode === "single" ? "strip" : "single";
+    void this.debugLog("toggle-mode", `mode=${this.mode}`);
 
     if (this.mode === "single") {
       await this.renderSingleView(false);
       return;
     }
 
-    await this.warmStripImages();
+    if (this.payload && this.payload.images.length === 1) {
+      const current = this.currentPath();
+      if (this.isTempOrArchiveImage(current)) {
+        this.showToast("长页模式已就绪。当前仅 1 张图片（压缩包临时文件），解压压缩包后即可长页畅读全套！", 4000);
+      }
+    }
+
     await this.renderStripView();
   }
 
+  private async stepSingleImage(step: number) {
+    if (!this.payload || !this.payload.images.length) {
+      return;
+    }
+
+    const total = this.payload.images.length;
+    if (total <= 1) {
+      const current = this.currentPath();
+      if (this.isTempOrArchiveImage(current)) {
+        this.showToast("当前为压缩包临时解压的单张图片。若需翻页浏览全部，请先解压压缩包后打开！", 3500);
+      } else {
+        this.showToast("当前文件夹仅有 1 张图片，无法翻页", 2000);
+      }
+      return;
+    }
+
+    const targetIndex = this.currentIndex + step;
+
+    if (targetIndex >= total) {
+      this.showToast(`已是最后一张图片 (${total}/${total})`, 1200);
+      return;
+    }
+
+    if (targetIndex < 0) {
+      this.showToast(`已是第一张图片 (1/${total})`, 1200);
+      return;
+    }
+
+    await this.goToIndex(targetIndex);
+  }
+
+  private handleSingleWheelNavigate(event: WheelEvent) {
+    this.logWheelShape(event);
+    if (!this.payload || !this.payload.images.length) {
+      return;
+    }
+
+    if (this.payload.images.length === 1) {
+      const current = this.currentPath();
+      if (this.isTempOrArchiveImage(current)) {
+        this.showToast("当前为压缩包临时解压的单张图片。若需翻页浏览全部，请先解压压缩包后打开！", 3500);
+      } else {
+        this.showToast("当前文件夹仅有 1 张图片，无法翻页", 2000);
+      }
+      return;
+    }
+
+    const now = performance.now();
+    if (now - this.lastWheelNavTime < 160) {
+      return;
+    }
+
+    const deltaY = event.deltaY;
+    if (deltaY === 0) {
+      return;
+    }
+
+    const isDiscreteNotch = event.deltaMode !== WheelEvent.DOM_DELTA_PIXEL || Math.abs(deltaY) >= 28;
+
+    if (isDiscreteNotch) {
+      this.wheelAccumulatorY = 0;
+      this.lastWheelNavTime = now;
+      const step = deltaY > 0 ? 1 : -1;
+      void this.stepSingleImage(step);
+      return;
+    }
+
+    this.wheelAccumulatorY += deltaY;
+
+    if (this.wheelResetTimer) {
+      window.clearTimeout(this.wheelResetTimer);
+    }
+    this.wheelResetTimer = window.setTimeout(() => {
+      this.wheelAccumulatorY = 0;
+    }, 200);
+
+    if (Math.abs(this.wheelAccumulatorY) >= 40) {
+      const step = this.wheelAccumulatorY > 0 ? 1 : -1;
+      this.wheelAccumulatorY = 0;
+      this.lastWheelNavTime = now;
+      void this.stepSingleImage(step);
+    }
+  }
+
   private async goToIndex(nextIndex: number) {
+    this.closeContextMenu();
     if (!this.payload) {
       return;
     }
 
     const boundedIndex = Math.min(Math.max(nextIndex, 0), this.payload.images.length - 1);
+    void this.debugLog("go-to-index", JSON.stringify({ from: this.currentIndex, to: boundedIndex }));
     if (boundedIndex === this.currentIndex) {
       return;
     }
@@ -396,7 +561,6 @@ class ViewerApp {
       await this.renderSingleView(true);
     } else {
       this.syncStripViewport();
-      void this.loadVisibleStripImages();
     }
 
     this.preloadNearby();
@@ -472,33 +636,43 @@ class ViewerApp {
       applyLoadedLayout();
     }
 
-    stage.addEventListener(
-      "wheel",
-      (event) => {
-        event.stopPropagation();
-        if (this.shouldZoomFromWheel(event)) {
-          event.preventDefault();
-          this.applyWheelZoom(event);
-          return;
-        }
+    stage.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0) return;
+      if (!this.canCurrentSingleImagePan()) return;
 
-        event.preventDefault();
-        if (this.isPrecisionTouchpadPan(event)) {
-          this.panBy(event.deltaX, event.deltaY);
-        } else {
-          void this.navigateFromWheel(event);
-        }
-      },
-      { passive: false }
-    );
+      this.isPanningImage = true;
+      stage.classList.add("is-panning");
+      this.panStartPoint = { x: event.clientX, y: event.clientY };
+      this.panBaseOffset = { x: this.panX, y: this.panY };
+      stage.setPointerCapture(event.pointerId);
+    });
 
     stage.addEventListener(
       "pointermove",
       (event) => {
         this.lastPointerPoint = { x: event.clientX, y: event.clientY };
+        if (!this.isPanningImage) return;
+
+        this.panX = this.panBaseOffset.x + (event.clientX - this.panStartPoint.x);
+        this.panY = this.panBaseOffset.y + (event.clientY - this.panStartPoint.y);
+        this.applySingleImageTransform();
       },
       { passive: true }
     );
+
+    const stopImagePan = (event: PointerEvent) => {
+      if (!this.isPanningImage) return;
+      this.isPanningImage = false;
+      stage.classList.remove("is-panning");
+      try {
+        stage.releasePointerCapture(event.pointerId);
+      } catch {
+        // Ignore pointer capture errors
+      }
+    };
+
+    stage.addEventListener("pointerup", stopImagePan);
+    stage.addEventListener("pointercancel", stopImagePan);
 
     stage.addEventListener("dblclick", () => {
       this.resetSingleScaleToLongSide();
@@ -586,8 +760,12 @@ class ViewerApp {
 
   private async renderStripView() {
     const viewport = this.getViewport();
-    // 一次性将全部图片 DOM 建好，由 CSS content-visibility:auto 控制渲染
-    this.stripLoadedCount = this.payload?.images.length ?? 0;
+    if (this.stripObserver) {
+      this.stripObserver.disconnect();
+      this.stripObserver = null;
+    }
+    this.stripLoadQueue = [];
+    this.stripActiveLoads = 0;
 
     viewport.innerHTML = `
       <section class="strip-view" id="strip-view"></section>
@@ -595,111 +773,140 @@ class ViewerApp {
 
     const strip = viewport.querySelector<HTMLDivElement>("#strip-view")!;
     strip.style.setProperty("--strip-width", `${this.stripWidthPercent}%`);
-    this.renderedStrip.clear();
-    this.loadingStrip.clear();
-    this.appendStripItems(strip);
+
+    if (!this.payload || !this.payload.images.length) {
+      this.renderEmpty("没有可显示的图片。");
+      return;
+    }
+
+    const fragment = document.createDocumentFragment();
+    for (let index = 0; index < this.payload.images.length; index += 1) {
+      const imagePath = this.payload.images[index];
+      const item = document.createElement("article");
+      item.className = "strip-item";
+      item.dataset.index = String(index);
+      item.dataset.path = imagePath;
+
+      const frame = document.createElement("div");
+      frame.className = "strip-item__frame";
+
+      const img = document.createElement("img");
+      img.className = "strip-item__image is-loading";
+      img.alt = this.fileNameFromPath(imagePath);
+      img.draggable = false;
+
+      const cached = this.cache.get(imagePath);
+      if (cached) {
+        img.onload = () => img.classList.remove("is-loading");
+        img.src = cached.src;
+        if (img.complete) {
+          img.classList.remove("is-loading");
+        }
+      }
+
+      frame.appendChild(img);
+      item.appendChild(frame);
+      fragment.appendChild(item);
+    }
+    strip.appendChild(fragment);
+
+    this.stripObserver = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          if (entry.isIntersecting) {
+            const index = Number((entry.target as HTMLElement).dataset.index);
+            if (!Number.isNaN(index)) {
+              this.enqueueStripLoad(index);
+            }
+          }
+        }
+      },
+      {
+        root: strip,
+        rootMargin: "800px 0px 800px 0px",
+      }
+    );
+
+    const allItems = Array.from(strip.children) as HTMLElement[];
+    allItems.forEach((item) => this.stripObserver?.observe(item));
 
     strip.addEventListener(
       "scroll",
       () => {
+        this.closeContextMenu();
         if (this.stripScrollFrame) {
           cancelAnimationFrame(this.stripScrollFrame);
         }
 
         this.stripScrollFrame = requestAnimationFrame(() => {
-          this.updateCurrentIndexFromStrip();
-          this.preloadNextStripImage();
-          void this.loadVisibleStripImages();
+          this.updateCurrentIndexFromStripCenter();
         });
       },
       { passive: true }
     );
 
-    this.syncStripViewport();
-    this.preloadNextStripImage();
-    await this.loadVisibleStripImages();
-    this.updateStatus();
-    this.updateTitle();
-  }
-
-  private updateCurrentIndexFromStrip() {
-    const strip = this.root.querySelector<HTMLDivElement>("#strip-view");
-    if (!strip) {
-      return;
-    }
-
-    const viewportCenter = window.innerHeight / 2;
-    let bestIndex = this.currentIndex;
-    let bestDistance = Number.POSITIVE_INFINITY;
-
-    for (const item of Array.from(strip.children) as HTMLDivElement[]) {
-      const rect = item.getBoundingClientRect();
-      const center = rect.top + rect.height / 2;
-      const distance = Math.abs(center - viewportCenter);
-
-      if (distance < bestDistance) {
-        bestDistance = distance;
-        bestIndex = Number(item.dataset.index);
-      }
-    }
-
-    this.currentIndex = bestIndex;
-    this.updateStatus();
-    this.updateTitle();
-  }
-
-  private async loadVisibleStripImages() {
-    const strip = this.root.querySelector<HTMLDivElement>("#strip-view");
-    if (!strip || !this.payload) {
-      return;
-    }
-
-    const candidates = Array.from(strip.children) as HTMLDivElement[];
-    const tasks: Promise<void>[] = [];
-
-    for (const item of candidates) {
-      const index = Number(item.dataset.index);
-      const imagePath = this.payload.images[index];
-
-      if (!imagePath) {
-        continue;
-      }
-
-      if (
-        this.renderedStrip.has(imagePath) ||
-        this.loadingStrip.has(imagePath) ||
-        !this.isStripItemNearViewport(item)
-      ) {
-        continue;
-      }
-
-      // 并行发起所有可见图的加载，不串行等待
-      tasks.push(this.loadStripImageAtIndex(index));
-    }
-
-    await Promise.allSettled(tasks);
-  }
-
-  private syncStripViewport() {
-    const strip = this.root.querySelector<HTMLDivElement>("#strip-view");
-    if (!strip) {
-      return;
-    }
-
+    // Initial scroll to current index
     const target = strip.querySelector<HTMLElement>(`.strip-item[data-index="${this.currentIndex}"]`);
-    target?.scrollIntoView({ block: "center", behavior: "auto" });
+    if (target) {
+      target.scrollIntoView({ block: "start", behavior: "auto" });
+    }
+
+    // Queue priority loads for current image and neighbors
+    this.enqueueStripLoad(this.currentIndex);
+    if (this.currentIndex + 1 < this.payload.images.length) {
+      this.enqueueStripLoad(this.currentIndex + 1);
+    }
+    if (this.currentIndex - 1 >= 0) {
+      this.enqueueStripLoad(this.currentIndex - 1);
+    }
+
+    this.updateStatus();
+    this.updateTitle();
   }
 
-  private ensureStripLoadedAhead() {
-    // DOM 已在 renderStripView 时一次性全部创建，此方法保留为兼容空实现
+  private updateCurrentIndexFromStripCenter() {
+    const viewport = this.getViewport();
+    const rect = viewport.getBoundingClientRect();
+    const centerX = rect.left + rect.width / 2;
+    const centerY = rect.top + rect.height / 2;
+
+    const el = document.elementFromPoint(centerX, centerY);
+    const item = el?.closest<HTMLElement>(".strip-item");
+    if (item && item.dataset.index !== undefined) {
+      const index = Number(item.dataset.index);
+      if (!Number.isNaN(index) && index !== this.currentIndex) {
+        this.currentIndex = index;
+        this.updateStatus();
+        this.updateTitle();
+      }
+    }
   }
 
-  private preloadNextStripImage() {
-    if (this.mode !== "strip") {
+  private enqueueStripLoad(index: number) {
+    if (!this.payload || index < 0 || index >= this.payload.images.length) {
       return;
     }
 
-    void this.loadStripImageAtIndex(this.currentIndex + 1);
+    const imagePath = this.payload.images[index];
+    if (!imagePath || this.renderedStrip.has(imagePath) || this.loadingStrip.has(imagePath)) {
+      return;
+    }
+
+    if (!this.stripLoadQueue.includes(index)) {
+      this.stripLoadQueue.push(index);
+      this.processStripLoadQueue();
+    }
+  }
+
+  private processStripLoadQueue() {
+    while (this.stripActiveLoads < this.maxConcurrentStripLoads && this.stripLoadQueue.length > 0) {
+      const nextIndex = this.stripLoadQueue.shift()!;
+      this.stripActiveLoads += 1;
+      void this.loadStripImageAtIndex(nextIndex).finally(() => {
+        this.stripActiveLoads -= 1;
+        this.processStripLoadQueue();
+      });
+    }
   }
 
   private async loadStripImageAtIndex(index: number) {
@@ -721,11 +928,17 @@ class ViewerApp {
     this.loadingStrip.add(imagePath);
     try {
       const imageSrc = await this.loadImageSource(imagePath);
-      img.src = imageSrc;
-      img.onload = () => img.classList.remove("is-loading");
+      img.onload = () => {
+        img.classList.remove("is-loading");
+      };
       img.onerror = () => {
+        img.classList.remove("is-loading");
         void this.debugLog("strip-image-error", JSON.stringify({ imagePath, imageSrc }));
       };
+      img.src = imageSrc;
+      if (img.complete) {
+        img.classList.remove("is-loading");
+      }
       this.renderedStrip.add(imagePath);
     } catch (error) {
       void this.debugLog("strip-image-error", JSON.stringify({ imagePath, error: String(error) }));
@@ -734,45 +947,46 @@ class ViewerApp {
     }
   }
 
-  private isStripItemNearViewport(item: HTMLElement) {
-    const rect = item.getBoundingClientRect();
-    const topLimit = -STRIP_LOAD_MARGIN_PX;
-    const bottomLimit = window.innerHeight + STRIP_LOAD_MARGIN_PX;
-    return rect.bottom >= topLimit && rect.top <= bottomLimit;
-  }
-
-  private getInitialStripLoadedCount() {
-    const total = this.payload?.images.length ?? 0;
-    if (!total) {
-      return 0;
-    }
-
-    return Math.min(total, this.currentIndex + STRIP_AHEAD_COUNT + 1);
-  }
-
-  private appendStripItems(strip: HTMLDivElement) {
-    if (!this.payload) {
+  private syncStripViewport() {
+    const strip = this.root.querySelector<HTMLDivElement>("#strip-view");
+    if (!strip) {
       return;
     }
 
-    const existingCount = strip.children.length;
-    for (let index = existingCount; index < this.stripLoadedCount; index += 1) {
-      const imagePath = this.payload.images[index];
-      if (!imagePath) {
-        continue;
-      }
+    const target = strip.querySelector<HTMLElement>(`.strip-item[data-index="${this.currentIndex}"]`);
+    target?.scrollIntoView({ block: "start", behavior: "auto" });
+  }
 
-      const item = document.createElement("article");
-      item.className = "strip-item";
-      item.dataset.index = String(index);
-      item.dataset.path = imagePath;
-      item.innerHTML = `
-        <div class="strip-item__frame">
-          <img class="strip-item__image is-loading" alt="" draggable="false" />
-        </div>
-      `;
-      strip.appendChild(item);
+  private canCurrentSingleImagePan(): boolean {
+    if (!this.singleImageNaturalWidth || !this.singleImageNaturalHeight) {
+      return false;
     }
+    const stageRect = this.getSingleStageRect();
+    const renderedWidth = this.getSingleImageRenderedWidth();
+    const renderedHeight = this.getSingleImageRenderedHeight();
+    return renderedWidth > stageRect.width || renderedHeight > stageRect.height;
+  }
+
+  private getSingleImageRenderedWidth(): number {
+    if (!this.singleImageNaturalWidth) return 0;
+    if (this.scaleMode === "fit-width") {
+      return this.getAvailableSingleImageWidth();
+    }
+    if (this.scaleMode === "fit-height") {
+      return this.singleImageNaturalWidth * (this.getAvailableSingleImageHeight() / this.singleImageNaturalHeight);
+    }
+    return Math.max(this.singleImageNaturalWidth * this.scale, 1);
+  }
+
+  private getSingleImageRenderedHeight(): number {
+    if (!this.singleImageNaturalHeight) return 0;
+    if (this.scaleMode === "fit-width") {
+      return this.singleImageNaturalHeight * (this.getAvailableSingleImageWidth() / this.singleImageNaturalWidth);
+    }
+    if (this.scaleMode === "fit-height") {
+      return this.getAvailableSingleImageHeight();
+    }
+    return Math.max(this.singleImageNaturalHeight * this.scale, 1);
   }
 
   private clampPan() {
@@ -781,22 +995,11 @@ class ViewerApp {
     }
 
     const stageRect = this.getSingleStageRect();
-    let renderedWidth = 0;
-    let renderedHeight = 0;
+    const renderedWidth = this.getSingleImageRenderedWidth();
+    const renderedHeight = this.getSingleImageRenderedHeight();
 
-    if (this.scaleMode === "fit-width") {
-      renderedWidth = this.getAvailableSingleImageWidth();
-      renderedHeight = this.singleImageNaturalHeight * (renderedWidth / this.singleImageNaturalWidth);
-    } else if (this.scaleMode === "fit-height") {
-      renderedHeight = this.getAvailableSingleImageHeight();
-      renderedWidth = this.singleImageNaturalWidth * (renderedHeight / this.singleImageNaturalHeight);
-    } else {
-      renderedWidth = Math.max(this.singleImageNaturalWidth * this.scale, 1);
-      renderedHeight = this.singleImageNaturalHeight * (renderedWidth / this.singleImageNaturalWidth);
-    }
-
-    const maxPanX = Math.abs(renderedWidth - stageRect.width) / 2;
-    const maxPanY = Math.abs(renderedHeight - stageRect.height) / 2;
+    const maxPanX = Math.max(0, (renderedWidth - stageRect.width) / 2);
+    const maxPanY = Math.max(0, (renderedHeight - stageRect.height) / 2);
 
     this.panX = Math.min(Math.max(this.panX, -maxPanX), maxPanX);
     this.panY = Math.min(Math.max(this.panY, -maxPanY), maxPanY);
@@ -822,6 +1025,11 @@ class ViewerApp {
       image.style.width = `${Math.max(this.singleImageNaturalWidth * this.scale, 1)}px`;
       image.style.height = "auto";
       image.style.transform = `translate(${this.panX}px, ${this.panY}px)`;
+    }
+
+    const stage = this.root.querySelector<HTMLDivElement>("#single-stage");
+    if (stage) {
+      stage.classList.toggle("can-pan", this.canCurrentSingleImagePan());
     }
 
     this.updateStatus();
@@ -898,20 +1106,6 @@ class ViewerApp {
     } catch {
       // Ignore decode failures here and let the visible element report load state.
     }
-  }
-
-  private async warmStripImages() {
-    if (!this.payload) {
-      return;
-    }
-
-    const indexes = [this.currentIndex - 1, this.currentIndex, this.currentIndex + 1];
-    const tasks = indexes
-      .map((index) => this.payload?.images[index])
-      .filter((path): path is string => Boolean(path))
-      .map((path) => this.loadImageSource(path));
-
-    await Promise.allSettled(tasks);
   }
 
   private async prepareDefaultApp() {
@@ -1031,33 +1225,6 @@ class ViewerApp {
     return trimmed;
   }
 
-  private shouldZoomFromWheel(event: WheelEvent) {
-    this.logWheelShape(event);
-    return event.ctrlKey || event.metaKey;
-  }
-
-  private isPrecisionTouchpadPan(event: WheelEvent) {
-    return (
-      event.deltaMode === WheelEvent.DOM_DELTA_PIXEL &&
-      !(event.ctrlKey || event.metaKey) &&
-      (Math.abs(event.deltaX) > 0 || Math.abs(event.deltaY) < 80)
-    );
-  }
-
-  private looksLikeTouchpadPinch(event: WheelEvent) {
-    return event.deltaMode === WheelEvent.DOM_DELTA_PIXEL && (event.ctrlKey || event.metaKey);
-  }
-
-  private async navigateFromWheel(event: WheelEvent) {
-    const now = performance.now();
-    if (now - this.lastWheelNavigateAt < 180) {
-      return;
-    }
-
-    this.lastWheelNavigateAt = now;
-    await this.goToIndex(this.currentIndex + (event.deltaY > 0 ? 1 : -1));
-  }
-
   private applyWheelZoom(event: WheelEvent) {
     this.logWheelShape(event);
     const now = performance.now();
@@ -1151,8 +1318,6 @@ class ViewerApp {
         ctrlKey: event.ctrlKey,
         metaKey: event.metaKey,
         shiftKey: event.shiftKey,
-        looksLikePinch: this.looksLikeTouchpadPinch(event),
-        looksLikePan: this.isPrecisionTouchpadPan(event),
       })
     );
   }
@@ -1199,20 +1364,34 @@ class ViewerApp {
 
   private updateTitle() {
     const path = this.currentPath();
+    const fileName = path ? this.fileNameFromPath(path) : "未打开图片";
     const pathElement = this.root.querySelector<HTMLSpanElement>("#current-path")!;
-    pathElement.textContent = path ? this.fileNameFromPath(path) : "未打开图片";
+    pathElement.textContent = fileName;
     pathElement.title = path ?? "";
+    const titleText = `See v0.2.0 - ${fileName}`;
+    document.title = titleText;
+    void this.appWindow.setTitle(titleText).catch(() => {});
   }
 
   private updateStatus() {
     const statusbar = this.root.querySelector<HTMLElement>("#statusbar")!;
     const total = this.payload?.images.length ?? 0;
+    const isTempSingle = total === 1 && this.isTempOrArchiveImage(this.currentPath());
     const zoomLabel =
       this.mode === "single"
         ? `${Math.round(this.getCurrentSingleScale() * 100)}%`
         : "长页浏览";
 
-    const baseText = total ? `${this.currentIndex + 1} / ${total}` : "准备就绪";
+    let baseText = "";
+    if (this.statusNotice) {
+      baseText = this.statusNotice;
+    } else if (isTempSingle) {
+      baseText = "1 / 1 · 压缩包临时单图（解压后可连看全套）";
+    } else if (total) {
+      baseText = `${this.currentIndex + 1} / ${total}`;
+    } else {
+      baseText = "准备就绪";
+    }
     const modeHint = this.mode === "single" ? "滚轮切图" : "滚轮滚动";
     const scaleControl =
       this.mode === "single"
@@ -1449,6 +1628,241 @@ class ViewerApp {
       .replaceAll(">", "&gt;")
       .replaceAll('"', "&quot;")
       .replaceAll("'", "&#39;");
+  }
+
+  private handleContextMenu(event: MouseEvent) {
+    if (!this.payload || !this.payload.images.length) {
+      this.closeContextMenu();
+      return;
+    }
+
+    let targetPath: string | null = null;
+
+    if (this.mode === "strip") {
+      const item = (event.target as HTMLElement | null)?.closest<HTMLElement>(".strip-item");
+      if (item && item.dataset.path) {
+        targetPath = item.dataset.path;
+      } else {
+        targetPath = this.currentPath();
+      }
+    } else {
+      targetPath = this.currentPath();
+    }
+
+    if (!targetPath) {
+      this.closeContextMenu();
+      return;
+    }
+
+    this.openContextMenu(event.clientX, event.clientY, targetPath);
+  }
+
+  private openContextMenu(x: number, y: number, targetPath: string) {
+    this.closeContextMenu();
+    this.contextMenuTarget = targetPath;
+
+    const menu = document.createElement("div");
+    menu.className = "context-menu";
+    menu.id = "context-menu";
+    menu.style.visibility = "hidden";
+    menu.innerHTML = `
+      <button class="context-menu__item" data-action="delete" type="button">
+        <span class="context-menu__item-main">
+          <svg class="context-menu__icon" viewBox="0 0 24 24">
+            <polyline points="3 6 5 6 21 6"></polyline>
+            <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+          </svg>
+          <span class="context-menu__label">删除</span>
+        </span>
+        <span class="context-menu__shortcut">Del</span>
+      </button>
+      <div class="context-menu__separator"></div>
+      <button class="context-menu__item context-menu__item--danger" data-action="delete-permanent" type="button">
+        <span class="context-menu__item-main">
+          <svg class="context-menu__icon" viewBox="0 0 24 24">
+            <polyline points="3 6 5 6 21 6"></polyline>
+            <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+            <line x1="10" y1="11" x2="10" y2="17"></line>
+            <line x1="14" y1="11" x2="14" y2="17"></line>
+          </svg>
+          <span class="context-menu__label">彻底删除（不放回收站）</span>
+        </span>
+        <span class="context-menu__shortcut">Shift+Del</span>
+      </button>
+    `;
+
+    menu.querySelector<HTMLButtonElement>('[data-action="delete"]')?.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const path = this.contextMenuTarget;
+      this.closeContextMenu();
+      if (path) {
+        void this.deleteImage(path, false);
+      }
+    });
+
+    menu.querySelector<HTMLButtonElement>('[data-action="delete-permanent"]')?.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const path = this.contextMenuTarget;
+      this.closeContextMenu();
+      if (path) {
+        void this.deleteImage(path, true);
+      }
+    });
+
+    document.body.appendChild(menu);
+    this.contextMenuElement = menu;
+
+    const menuRect = menu.getBoundingClientRect();
+    const margin = 8;
+    let posX = x;
+    let posY = y;
+
+    if (posX + menuRect.width > window.innerWidth - margin) {
+      posX = Math.max(margin, window.innerWidth - menuRect.width - margin);
+    }
+    if (posY + menuRect.height > window.innerHeight - margin) {
+      posY = Math.max(margin, window.innerHeight - menuRect.height - margin);
+    }
+
+    menu.style.left = `${posX}px`;
+    menu.style.top = `${posY}px`;
+    menu.style.visibility = "";
+  }
+
+  private isContextMenuOpen(): boolean {
+    return Boolean(this.contextMenuElement && this.contextMenuElement.isConnected);
+  }
+
+  private closeContextMenu = () => {
+    if (this.contextMenuElement) {
+      this.contextMenuElement.remove();
+      this.contextMenuElement = null;
+      this.contextMenuTarget = null;
+    }
+  };
+
+  private async deleteImage(targetPath: string, permanently: boolean) {
+    if (!this.payload || !this.payload.images.length) {
+      return;
+    }
+
+    const fileName = this.fileNameFromPath(targetPath);
+    if (permanently) {
+      const confirmed = window.confirm(
+        `确定要彻底删除 "${fileName}" 吗？\n文件将直接从磁盘中删除，无法从回收站恢复。`
+      );
+      if (!confirmed) {
+        return;
+      }
+    }
+
+    try {
+      await invoke("delete_image_file", { path: targetPath, permanently });
+      void this.debugLog("delete-image-success", JSON.stringify({ path: targetPath, permanently }));
+    } catch (error) {
+      void this.debugLog("delete-image-error", JSON.stringify({ path: targetPath, permanently, error: String(error) }));
+      this.showStatusNotice(`删除失败：${String(error)}`, 5000);
+      return;
+    }
+
+    const targetIndex = this.payload.images.indexOf(targetPath);
+    if (targetIndex === -1) {
+      return;
+    }
+
+    // Cleanup caches
+    this.cache.delete(targetPath);
+    this.renderedStrip.delete(targetPath);
+    this.loadingStrip.delete(targetPath);
+    this.imageFallbacks.delete(targetPath);
+
+    // Remove from image list
+    this.payload.images.splice(targetIndex, 1);
+
+    const actionLabel = permanently ? "彻底删除" : "移至回收站";
+
+    if (this.payload.images.length === 0) {
+      this.payload.currentPath = null;
+      this.currentIndex = 0;
+      this.renderEmpty("文件夹中已无更多图片。");
+      this.updateTitle();
+      this.showStatusNotice(`已${actionLabel}：${fileName} · 文件夹已空`);
+      return;
+    }
+
+    // Adjust currentIndex
+    if (targetIndex < this.currentIndex) {
+      this.currentIndex -= 1;
+    } else if (targetIndex === this.currentIndex) {
+      if (this.currentIndex >= this.payload.images.length) {
+        this.currentIndex = this.payload.images.length - 1;
+      }
+    }
+    this.payload.currentPath = this.payload.images[this.currentIndex];
+
+    if (this.mode === "single") {
+      await this.renderSingleView(true);
+      this.preloadNearby();
+      this.showStatusNotice(`已${actionLabel}：${fileName}`);
+    } else {
+      const strip = this.root.querySelector<HTMLDivElement>("#strip-view");
+      if (strip) {
+        const items = Array.from(strip.querySelectorAll<HTMLElement>(".strip-item"));
+        const targetItem = items.find((elem) => elem.dataset.path === targetPath);
+        if (targetItem && this.stripObserver) {
+          this.stripObserver.unobserve(targetItem);
+        }
+        targetItem?.remove();
+
+        const remainingItems = Array.from(strip.querySelectorAll<HTMLElement>(".strip-item"));
+        remainingItems.forEach((elem, idx) => {
+          elem.dataset.index = String(idx);
+        });
+        this.updateCurrentIndexFromStripCenter();
+        this.updateTitle();
+        this.updateStatus();
+      }
+      this.showStatusNotice(`已${actionLabel}：${fileName}`);
+    }
+  }
+
+  private showStatusNotice(message: string, durationMs = 3500) {
+    this.statusNotice = message;
+    if (this.statusNoticeTimer) {
+      window.clearTimeout(this.statusNoticeTimer);
+    }
+    this.updateStatus();
+    this.showToast(message, Math.min(durationMs, 3000));
+    this.statusNoticeTimer = window.setTimeout(() => {
+      this.statusNotice = null;
+      this.statusNoticeTimer = null;
+      this.updateStatus();
+    }, durationMs);
+  }
+
+  private showToast(message: string, durationMs = 2500) {
+    if (this.toastElement) {
+      this.toastElement.remove();
+      this.toastElement = null;
+    }
+    if (this.toastTimer) {
+      window.clearTimeout(this.toastTimer);
+      this.toastTimer = null;
+    }
+
+    const toast = document.createElement("div");
+    toast.className = "toast-notice";
+    toast.textContent = message;
+    document.body.appendChild(toast);
+    this.toastElement = toast;
+
+    this.toastTimer = window.setTimeout(() => {
+      if (this.toastElement === toast) {
+        toast.remove();
+        this.toastElement = null;
+        this.toastTimer = null;
+      }
+    }, durationMs);
   }
 
   private async toggleFullscreen() {

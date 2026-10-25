@@ -259,6 +259,23 @@ fn append_debug_log(label: String, message: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn delete_image_file(path: String, permanently: bool) -> Result<(), String> {
+  append_native_log("delete_image_file", &format!("path={path}, permanently={permanently}"));
+  let path_buf = resolve_input_path(PathBuf::from(&path)).unwrap_or_else(|| PathBuf::from(&path));
+  if !path_buf.exists() {
+    return Err(format!("文件不存在: {}", path));
+  }
+
+  if permanently {
+    fs::remove_file(&path_buf).map_err(|error| format!("彻底删除失败: {error}"))?;
+  } else {
+    trash::delete(&path_buf).map_err(|error| format!("移至回收站失败: {error}"))?;
+  }
+
+  Ok(())
+}
+
+#[tauri::command]
 fn start_window_drag(window: tauri::Window) -> Result<(), String> {
   window
     .start_dragging()
@@ -641,6 +658,36 @@ mod tests {
     assert_eq!(natural_compare("frame001.png", "frame1.png"), Ordering::Greater);
     assert_eq!(natural_compare("frame0002.png", "frame0010.png"), Ordering::Less);
   }
+
+  #[test]
+  fn test_delete_image_file_not_found() {
+    let result = super::delete_image_file("non_existent_file_12345.png".to_string(), false);
+    assert!(result.is_err());
+  }
+
+  #[test]
+  fn test_delete_image_file_permanently() {
+    let temp_dir = std::env::temp_dir();
+    let file_path = temp_dir.join("test_see_permanent_del.png");
+    std::fs::write(&file_path, b"test").unwrap();
+    assert!(file_path.exists());
+
+    let result = super::delete_image_file(file_path.to_string_lossy().to_string(), true);
+    assert!(result.is_ok());
+    assert!(!file_path.exists());
+  }
+
+  #[test]
+  fn test_delete_image_file_to_trash() {
+    let temp_dir = std::env::temp_dir();
+    let file_path = temp_dir.join("test_see_trash_del.png");
+    std::fs::write(&file_path, b"test").unwrap();
+    assert!(file_path.exists());
+
+    let result = super::delete_image_file(file_path.to_string_lossy().to_string(), false);
+    assert!(result.is_ok());
+    assert!(!file_path.exists());
+  }
 }
 
 pub fn run() {
@@ -673,7 +720,8 @@ pub fn run() {
       is_presentation_mode,
       toggle_presentation_mode,
       close_window,
-      prepare_default_app_integration
+      prepare_default_app_integration,
+      delete_image_file
     ])
     .setup(|app| {
       if let Some(window) = app.get_webview_window("main") {
@@ -832,6 +880,29 @@ fn prepare_windows_file_associations() -> Result<(), String> {
   registered_apps
     .set_value("See", &"Software\\See\\Capabilities")
     .map_err(|error| format!("failed to register application capabilities: {error}"))?;
+
+  // Also register under Applications\see.exe for Windows Explorer Open-With compatibility
+  let (app_key, _) = classes
+    .create_subkey("Applications\\see.exe\\shell\\open\\command")
+    .map_err(|error| format!("failed to create Applications open command: {error}"))?;
+  app_key
+    .set_value("", &format!("\"{exe_string}\" \"%1\""))
+    .map_err(|error| format!("failed to set Applications open command: {error}"))?;
+
+  let (app_types, _) = classes
+    .create_subkey("Applications\\see.exe\\SupportedTypes")
+    .map_err(|error| format!("failed to create SupportedTypes: {error}"))?;
+  for ext in SUPPORTED_EXTENSIONS {
+    let _ = app_types.set_value(format!(".{ext}"), &"");
+  }
+
+  // Register in App Paths for direct execution via 'see.exe'
+  let (app_paths, _) = hkcu
+    .create_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\see.exe")
+    .map_err(|error| format!("failed to create App Paths: {error}"))?;
+  app_paths
+    .set_value("", &exe_string)
+    .map_err(|error| format!("failed to set App Paths: {error}"))?;
 
   Ok(())
 }

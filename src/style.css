@@ -168,6 +168,21 @@ img {
   font-weight: 700;
   letter-spacing: 0.12em;
   text-transform: uppercase;
+  display: inline-flex;
+  align-items: center;
+}
+
+.topbar__badge {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: rgba(34, 197, 94, 0.2);
+  color: #4ade80;
+  border: 1px solid rgba(74, 222, 128, 0.3);
+  letter-spacing: 0.04em;
+  text-transform: none;
+  margin-left: 6px;
 }
 
 .topbar__path {
@@ -255,6 +270,15 @@ img {
   overflow: hidden;
   touch-action: none;
   overscroll-behavior: contain;
+  user-select: none;
+}
+
+.single-stage.can-pan {
+  cursor: grab;
+}
+
+.single-stage.is-panning {
+  cursor: grabbing;
 }
 
 .single-image {
@@ -263,6 +287,7 @@ img {
   transition: opacity 120ms ease;
   will-change: width, height;
   box-shadow: 0 24px 100px rgba(0, 0, 0, 0.35);
+  user-select: none;
 }
 
 .strip-view {
@@ -270,30 +295,55 @@ img {
   height: 100%;
   overflow-y: auto;
   overflow-x: hidden;
-  scroll-behavior: smooth;
+  scroll-behavior: auto;
+  overflow-anchor: auto;
+}
+
+.strip-view::-webkit-scrollbar {
+  width: 8px;
+}
+
+.strip-view::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.strip-view::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.16);
+  border-radius: 4px;
+}
+
+.strip-view::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.32);
 }
 
 .strip-item {
   width: 100%;
-  content-visibility: auto;
-  contain-intrinsic-size: 720px;
+  min-height: 120px;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  padding: 4px 0;
+  overflow-anchor: none;
 }
 
 .strip-item__frame {
   width: 100%;
   display: flex;
   justify-content: center;
+  align-items: center;
   line-height: 0;
 }
 
 .strip-item__image {
   width: var(--strip-width, 100%);
+  max-width: 100%;
   height: auto;
   display: block;
+  transition: opacity 160ms ease;
 }
 
 .is-loading {
-  opacity: 0.3;
+  opacity: 0.25;
 }
 
 .empty-state h1 {
@@ -305,3 +355,139 @@ img {
   margin: 0;
   color: rgba(240, 244, 251, 0.72);
 }
+
+/* Context Menu */
+.context-menu {
+  position: fixed;
+  z-index: 99999;
+  min-width: 230px;
+  background: rgba(26, 30, 38, 0.94);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 10px;
+  box-shadow: 0 16px 36px rgba(0, 0, 0, 0.55), 0 2px 8px rgba(0, 0, 0, 0.35);
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  animation: context-menu-fade-in 100ms ease-out;
+  user-select: none;
+}
+
+@keyframes context-menu-fade-in {
+  from {
+    opacity: 0;
+    transform: scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.context-menu__item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: #f0f4f9;
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+  outline: none;
+}
+
+.context-menu__item-main {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.context-menu__icon {
+  width: 15px;
+  height: 15px;
+  flex-shrink: 0;
+  stroke: currentColor;
+  stroke-width: 2;
+  fill: none;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.context-menu__label {
+  white-space: nowrap;
+}
+
+.context-menu__shortcut {
+  font-size: 11px;
+  color: rgba(240, 244, 249, 0.45);
+  font-family: inherit;
+  margin-left: 16px;
+  white-space: nowrap;
+}
+
+.context-menu__item:hover,
+.context-menu__item:focus-visible {
+  background: rgba(255, 255, 255, 0.1);
+  color: #fff;
+}
+
+.context-menu__item:hover .context-menu__shortcut,
+.context-menu__item:focus-visible .context-menu__shortcut {
+  color: rgba(255, 255, 255, 0.75);
+}
+
+.context-menu__item--danger:hover,
+.context-menu__item--danger:focus-visible {
+  background: rgba(239, 68, 68, 0.2);
+  color: #fca5a5;
+}
+
+.context-menu__item--danger:hover .context-menu__shortcut,
+.context-menu__item--danger:focus-visible .context-menu__shortcut {
+  color: #fca5a5;
+}
+
+.context-menu__separator {
+  height: 1px;
+  background: rgba(255, 255, 255, 0.08);
+  margin: 4px 2px;
+}
+
+/* Toast Notice */
+.toast-notice {
+  position: fixed;
+  bottom: 48px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(18, 22, 29, 0.92);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 8px;
+  color: #fff;
+  padding: 8px 16px;
+  font-size: 13px;
+  z-index: 10000;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  pointer-events: none;
+  animation: toast-fade-in 120ms ease-out;
+}
+
+@keyframes toast-fade-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, 8px);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
+}
+
