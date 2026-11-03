@@ -1,6 +1,5 @@
 use std::{
   fs,
-  io::Write,
   path::{Path, PathBuf},
   process::Command,
   sync::Mutex,
@@ -210,9 +209,17 @@ impl<R: tauri::Runtime> PresentationHost for tauri::WebviewWindow<R> {
 }
 
 fn append_native_log(label: &str, message: &str) {
-  let log_path = std::env::temp_dir().join("see-debug.log");
-  if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(log_path) {
-    let _ = writeln!(file, "[native:{label}] {message}");
+  #[cfg(debug_assertions)]
+  {
+    use std::io::Write as _;
+    let log_path = std::env::temp_dir().join("see-debug.log");
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(log_path) {
+      let _ = writeln!(file, "[native:{label}] {message}");
+    }
+  }
+  #[cfg(not(debug_assertions))]
+  {
+    let _ = (label, message);
   }
 }
 
@@ -241,19 +248,21 @@ fn read_image_data_url(path: String) -> Result<String, String> {
   let path_buf = resolve_input_path(PathBuf::from(&path)).unwrap_or_else(|| PathBuf::from(path));
   let bytes = fs::read(&path_buf).map_err(|error| format!("failed to read image bytes: {error}"))?;
   let mime = mime_from_path(&path_buf);
-  Ok(format!("data:{mime};base64,{}", STANDARD.encode(bytes)))
+  let prefix = format!("data:{mime};base64,");
+  let encoded_len = ((bytes.len() + 2) / 3) * 4;
+  let mut result = String::with_capacity(prefix.len() + encoded_len);
+  result.push_str(&prefix);
+  STANDARD.encode_string(&bytes, &mut result);
+  Ok(result)
 }
 
 #[tauri::command]
 fn append_debug_log(label: String, message: String) -> Result<(), String> {
-  append_native_log(&label, &message);
-  let log_path = std::env::temp_dir().join("see-debug.log");
-  let mut file = fs::OpenOptions::new()
-    .create(true)
-    .append(true)
-    .open(&log_path)
-    .map_err(|error| format!("failed to open debug log: {error}"))?;
-  writeln!(file, "[{label}] {message}").map_err(|error| format!("failed to write debug log: {error}"))?;
+  #[cfg(debug_assertions)]
+  {
+    append_native_log(&label, &message);
+  }
+  let _ = (label, message);
   Ok(())
 }
 
@@ -458,29 +467,26 @@ fn mime_from_path(path: &Path) -> &'static str {
 }
 
 fn collect_images(directory: &Path) -> Vec<String> {
-  let mut files: Vec<PathBuf> = match fs::read_dir(directory) {
-    Ok(entries) => entries
+  let mut entries: Vec<(PathBuf, String)> = match fs::read_dir(directory) {
+    Ok(read_dir) => read_dir
       .filter_map(|entry| entry.ok().map(|item| item.path()))
       .filter(|path| path.is_file() && is_supported_image(path))
+      .map(|path| {
+        let name = path
+          .file_name()
+          .map(|n| n.to_string_lossy().to_string())
+          .unwrap_or_default();
+        (path, name)
+      })
       .collect(),
     Err(_) => Vec::new(),
   };
 
-  files.sort_by(|a, b| natord(a, b));
-  files.into_iter().filter_map(|path| normalize_path(&path)).collect()
-}
-
-fn natord(left: &Path, right: &Path) -> std::cmp::Ordering {
-  let left_name = left
-    .file_name()
-    .map(|item| item.to_string_lossy().to_string())
-    .unwrap_or_default();
-  let right_name = right
-    .file_name()
-    .map(|item| item.to_string_lossy().to_string())
-    .unwrap_or_default();
-
-  natural_compare(&left_name, &right_name)
+  entries.sort_by(|a, b| natural_compare(&a.1, &b.1));
+  entries
+    .into_iter()
+    .map(|(path, _)| sanitize_path_for_webview(&path))
+    .collect()
 }
 
 fn natural_compare(left: &str, right: &str) -> std::cmp::Ordering {
@@ -524,34 +530,88 @@ fn natural_compare(left: &str, right: &str) -> std::cmp::Ordering {
   }
 }
 
-fn collect_digit_chunk<I>(chars: &mut std::iter::Peekable<I>) -> String
+struct DigitChunk {
+  buf: [u8; 64],
+  len: usize,
+  overflow: Vec<u8>,
+}
+
+impl Default for DigitChunk {
+  fn default() -> Self {
+    Self {
+      buf: [0u8; 64],
+      len: 0,
+      overflow: Vec::new(),
+    }
+  }
+}
+
+impl DigitChunk {
+  #[inline]
+  fn push(&mut self, b: u8) {
+    if self.overflow.is_empty() {
+      if self.len < 64 {
+        self.buf[self.len] = b;
+        self.len += 1;
+        return;
+      }
+      self.overflow.reserve(128);
+      self.overflow.extend_from_slice(&self.buf[..self.len]);
+    }
+    self.overflow.push(b);
+  }
+
+  #[inline]
+  fn as_slice(&self) -> &[u8] {
+    if self.overflow.is_empty() {
+      &self.buf[..self.len]
+    } else {
+      &self.overflow
+    }
+  }
+}
+
+fn collect_digit_chunk<I>(chars: &mut std::iter::Peekable<I>) -> DigitChunk
 where
   I: Iterator<Item = char>,
 {
-  let mut chunk = String::new();
-  while let Some(next) = chars.peek().copied() {
+  let mut chunk = DigitChunk::default();
+  while let Some(&next) = chars.peek() {
     if !next.is_ascii_digit() {
       break;
     }
-    chunk.push(next);
+    chunk.push(next as u8);
     chars.next();
   }
   chunk
 }
 
-fn compare_numeric_chunks(left: &str, right: &str) -> std::cmp::Ordering {
-  let left_trimmed = left.trim_start_matches('0');
-  let right_trimmed = right.trim_start_matches('0');
-  let left_significant = if left_trimmed.is_empty() { "0" } else { left_trimmed };
-  let right_significant = if right_trimmed.is_empty() { "0" } else { right_trimmed };
+fn compare_numeric_chunks(left: &DigitChunk, right: &DigitChunk) -> std::cmp::Ordering {
+  let left_slice = left.as_slice();
+  let right_slice = right.as_slice();
+
+  let left_trimmed = trim_leading_zeros(left_slice);
+  let right_trimmed = trim_leading_zeros(right_slice);
+
+  let left_significant = if left_trimmed.is_empty() { b"0" as &[u8] } else { left_trimmed };
+  let right_significant = if right_trimmed.is_empty() { b"0" as &[u8] } else { right_trimmed };
 
   match left_significant.len().cmp(&right_significant.len()) {
     std::cmp::Ordering::Equal => match left_significant.cmp(right_significant) {
-      std::cmp::Ordering::Equal => left.len().cmp(&right.len()),
+      std::cmp::Ordering::Equal => left_slice.len().cmp(&right_slice.len()),
       other => other,
     },
     other => other,
   }
+}
+
+#[inline]
+fn trim_leading_zeros(slice: &[u8]) -> &[u8] {
+  let mut start = 0;
+  while start < slice.len() && slice[start] == b'0' {
+    start += 1;
+  }
+  &slice[start..]
 }
 
 fn emit_native_drop(window: &tauri::Window, paths: &[PathBuf]) {

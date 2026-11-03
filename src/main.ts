@@ -40,11 +40,13 @@ class ViewerApp {
   private scaleMode: ScaleMode = "actual";
   private scale = 1;
   private cache = new Map<string, ImageCacheEntry>();
+  private inFlightLoads = new Map<string, Promise<string>>();
   private renderedStrip = new Set<string>();
   private loadingStrip = new Set<string>();
   private singleImageNaturalWidth = 0;
   private singleImageNaturalHeight = 0;
   private stripScrollFrame = 0;
+  private resizeFrame = 0;
   private pinchDistance: number | null = null;
   private pinchBaseScale = 1;
   private pinchBasePan = { x: 0, y: 0 };
@@ -384,6 +386,7 @@ class ViewerApp {
       );
       this.mode = "single";
       this.cache.clear();
+      this.inFlightLoads.clear();
       this.renderedStrip.clear();
       this.loadingStrip.clear();
       await this.renderSingleView(true);
@@ -593,7 +596,7 @@ class ViewerApp {
 
         this.panX = this.panBaseOffset.x + (event.clientX - this.panStartPoint.x);
         this.panY = this.panBaseOffset.y + (event.clientY - this.panStartPoint.y);
-        this.applySingleImageTransform();
+        this.applySingleImageTransform(false);
       },
       { passive: true }
     );
@@ -941,7 +944,7 @@ class ViewerApp {
     this.panY = Math.min(Math.max(this.panY, -maxPanY), maxPanY);
   }
 
-  private applySingleImageTransform() {
+  private applySingleImageTransform(updateStatus = true) {
     this.clampPan();
 
     const image = this.root.querySelector<HTMLImageElement>("#single-image");
@@ -952,15 +955,15 @@ class ViewerApp {
     if (this.scaleMode === "fit-width") {
       image.style.width = `${this.getAvailableSingleImageWidth()}px`;
       image.style.height = "auto";
-      image.style.transform = `translate(${this.panX}px, ${this.panY}px)`;
+      image.style.transform = `translate3d(${this.panX}px, ${this.panY}px, 0)`;
     } else if (this.scaleMode === "fit-height") {
       image.style.width = "auto";
       image.style.height = `${this.getAvailableSingleImageHeight()}px`;
-      image.style.transform = `translate(${this.panX}px, ${this.panY}px)`;
+      image.style.transform = `translate3d(${this.panX}px, ${this.panY}px, 0)`;
     } else {
       image.style.width = `${Math.max(this.singleImageNaturalWidth * this.scale, 1)}px`;
       image.style.height = "auto";
-      image.style.transform = `translate(${this.panX}px, ${this.panY}px)`;
+      image.style.transform = `translate3d(${this.panX}px, ${this.panY}px, 0)`;
     }
 
     const stage = this.root.querySelector<HTMLDivElement>("#single-stage");
@@ -968,7 +971,9 @@ class ViewerApp {
       stage.classList.toggle("can-pan", this.canCurrentSingleImagePan());
     }
 
-    this.updateStatus();
+    if (updateStatus) {
+      this.updateStatus();
+    }
   }
 
   private preloadNearby() {
@@ -997,14 +1002,30 @@ class ViewerApp {
     const cached = this.cache.get(path);
     if (cached) {
       cached.loadedAt = Date.now();
+      this.cache.delete(path);
+      this.cache.set(path, cached);
       return cached.src;
     }
 
-    const src = await invoke<string>("read_image_data_url", { path });
-    this.cache.set(path, { src, loadedAt: Date.now() });
-    this.evictCacheIfNeeded();
-    void this.primeDecode(src);
-    return src;
+    const inFlight = this.inFlightLoads.get(path);
+    if (inFlight) {
+      return inFlight;
+    }
+
+    const loadPromise = (async () => {
+      try {
+        const src = await invoke<string>("read_image_data_url", { path });
+        this.cache.set(path, { src, loadedAt: Date.now() });
+        this.evictCacheIfNeeded();
+        void this.primeDecode(src);
+        return src;
+      } finally {
+        this.inFlightLoads.delete(path);
+      }
+    })();
+
+    this.inFlightLoads.set(path, loadPromise);
+    return loadPromise;
   }
 
   private handleSingleImageError(imagePath: string) {
@@ -1265,14 +1286,13 @@ class ViewerApp {
   }
 
   private evictCacheIfNeeded() {
-    if (this.cache.size <= CACHE_LIMIT) {
-      return;
-    }
-
-    const entries = Array.from(this.cache.entries()).sort((a, b) => a[1].loadedAt - b[1].loadedAt);
-    while (entries.length && this.cache.size > CACHE_LIMIT) {
-      const [oldestPath] = entries.shift()!;
-      this.cache.delete(oldestPath);
+    while (this.cache.size > CACHE_LIMIT) {
+      const oldestKey = this.cache.keys().next().value;
+      if (oldestKey !== undefined) {
+        this.cache.delete(oldestKey);
+      } else {
+        break;
+      }
     }
   }
 
@@ -1383,7 +1403,12 @@ class ViewerApp {
       this.mode === "single" &&
       (this.scaleMode === "fit-width" || this.scaleMode === "fit-height")
     ) {
-      this.applySingleImageTransform();
+      if (this.resizeFrame) {
+        cancelAnimationFrame(this.resizeFrame);
+      }
+      this.resizeFrame = requestAnimationFrame(() => {
+        this.applySingleImageTransform();
+      });
     }
   };
 
@@ -1541,6 +1566,9 @@ class ViewerApp {
   }
 
   private async debugLog(label: string, message: string) {
+    if (!import.meta.env.DEV) {
+      return;
+    }
     try {
       await invoke("append_debug_log", { label, message });
     } catch {
@@ -1691,6 +1719,7 @@ class ViewerApp {
 
     // Cleanup caches
     this.cache.delete(targetPath);
+    this.inFlightLoads.delete(targetPath);
     this.renderedStrip.delete(targetPath);
     this.loadingStrip.delete(targetPath);
 
