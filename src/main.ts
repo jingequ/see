@@ -134,7 +134,7 @@ class ViewerApp {
         <header class="topbar">
           <div class="topbar__drag" id="drag-surface">
             <div class="topbar__meta">
-              <span class="topbar__title">See <span class="topbar__badge">v0.2.0 新版</span></span>
+              <span class="topbar__title">See</span>
               <span class="topbar__path" id="current-path"></span>
             </div>
           </div>
@@ -426,19 +426,6 @@ class ViewerApp {
     }
   }
 
-  private isTempOrArchiveImage(path: string | null): boolean {
-    if (!path) return false;
-    const lower = path.toLowerCase();
-    return (
-      lower.includes("\\temp\\") ||
-      lower.includes("/temp/") ||
-      lower.includes(".zip.") ||
-      lower.includes(".rar.") ||
-      lower.includes(".7z.") ||
-      lower.includes("zipmaster")
-    );
-  }
-
   private async toggleMode() {
     this.closeContextMenu();
     this.mode = this.mode === "single" ? "strip" : "single";
@@ -447,13 +434,6 @@ class ViewerApp {
     if (this.mode === "single") {
       await this.renderSingleView(false);
       return;
-    }
-
-    if (this.payload && this.payload.images.length === 1) {
-      const current = this.currentPath();
-      if (this.isTempOrArchiveImage(current)) {
-        this.showToast("长页模式已就绪。当前仅 1 张图片（压缩包临时文件），解压压缩包后即可长页畅读全套！", 4000);
-      }
     }
 
     await this.renderStripView();
@@ -466,12 +446,6 @@ class ViewerApp {
 
     const total = this.payload.images.length;
     if (total <= 1) {
-      const current = this.currentPath();
-      if (this.isTempOrArchiveImage(current)) {
-        this.showToast("当前为压缩包临时解压的单张图片。若需翻页浏览全部，请先解压压缩包后打开！", 3500);
-      } else {
-        this.showToast("当前文件夹仅有 1 张图片，无法翻页", 2000);
-      }
       return;
     }
 
@@ -492,17 +466,7 @@ class ViewerApp {
 
   private handleSingleWheelNavigate(event: WheelEvent) {
     this.logWheelShape(event);
-    if (!this.payload || !this.payload.images.length) {
-      return;
-    }
-
-    if (this.payload.images.length === 1) {
-      const current = this.currentPath();
-      if (this.isTempOrArchiveImage(current)) {
-        this.showToast("当前为压缩包临时解压的单张图片。若需翻页浏览全部，请先解压压缩包后打开！", 3500);
-      } else {
-        this.showToast("当前文件夹仅有 1 张图片，无法翻页", 2000);
-      }
+    if (!this.payload || this.payload.images.length <= 1) {
       return;
     }
 
@@ -1368,7 +1332,7 @@ class ViewerApp {
     const pathElement = this.root.querySelector<HTMLSpanElement>("#current-path")!;
     pathElement.textContent = fileName;
     pathElement.title = path ?? "";
-    const titleText = `See v0.2.0 - ${fileName}`;
+    const titleText = path ? `See - ${fileName}` : "See";
     document.title = titleText;
     void this.appWindow.setTitle(titleText).catch(() => {});
   }
@@ -1376,22 +1340,16 @@ class ViewerApp {
   private updateStatus() {
     const statusbar = this.root.querySelector<HTMLElement>("#statusbar")!;
     const total = this.payload?.images.length ?? 0;
-    const isTempSingle = total === 1 && this.isTempOrArchiveImage(this.currentPath());
     const zoomLabel =
       this.mode === "single"
         ? `${Math.round(this.getCurrentSingleScale() * 100)}%`
         : "长页浏览";
 
-    let baseText = "";
-    if (this.statusNotice) {
-      baseText = this.statusNotice;
-    } else if (isTempSingle) {
-      baseText = "1 / 1 · 压缩包临时单图（解压后可连看全套）";
-    } else if (total) {
-      baseText = `${this.currentIndex + 1} / ${total}`;
-    } else {
-      baseText = "准备就绪";
-    }
+    const baseText = this.statusNotice
+      ? this.statusNotice
+      : total
+        ? `${this.currentIndex + 1} / ${total}`
+        : "准备就绪";
     const modeHint = this.mode === "single" ? "滚轮切图" : "滚轮滚动";
     const scaleControl =
       this.mode === "single"
@@ -1747,14 +1705,6 @@ class ViewerApp {
     }
 
     const fileName = this.fileNameFromPath(targetPath);
-    if (permanently) {
-      const confirmed = window.confirm(
-        `确定要彻底删除 "${fileName}" 吗？\n文件将直接从磁盘中删除，无法从回收站恢复。`
-      );
-      if (!confirmed) {
-        return;
-      }
-    }
 
     try {
       await invoke("delete_image_file", { path: targetPath, permanently });
