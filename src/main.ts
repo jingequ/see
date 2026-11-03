@@ -26,8 +26,6 @@ interface AssociationResult {
 const STRIP_TOGGLE_KEY = "Tab";
 const PRELOAD_DISTANCE = 2;
 const CACHE_LIMIT = 12;
-const STRIP_AHEAD_COUNT = 3;
-const STRIP_LOAD_MARGIN_PX = 2400;
 const TOUCHPAD_PINCH_ZOOM_SENSITIVITY = 0.006;
 const CTRL_MOUSE_WHEEL_ZOOM_SENSITIVITY = 0.001;
 const MOUSE_WHEEL_DELTA_STEP = 50;
@@ -64,7 +62,6 @@ class ViewerApp {
   private dragPointerId: number | null = null;
   private dragStartPoint: { x: number; y: number } | null = null;
   private dragTriggered = false;
-  private imageFallbacks = new Set<string>();
   private stripObserver: IntersectionObserver | null = null;
   private stripLoadQueue: number[] = [];
   private stripActiveLoads = 0;
@@ -109,21 +106,15 @@ class ViewerApp {
   }
 
   private bindNativeBridges() {
-    (
-      window as Window & {
-        __SEE_SYNC_PRESENTATION_MODE__?: (enabled: boolean) => void;
-        __SEE_OPEN_DROPPED_PATHS__?: (paths: string[]) => void;
-      }
-    ).__SEE_SYNC_PRESENTATION_MODE__ = (enabled: boolean) => {
+    interface SeeWindow extends Window {
+      __SEE_SYNC_PRESENTATION_MODE__?: (enabled: boolean) => void;
+      __SEE_OPEN_DROPPED_PATHS__?: (paths: string[]) => void;
+    }
+    const win = window as SeeWindow;
+    win.__SEE_SYNC_PRESENTATION_MODE__ = (enabled: boolean) => {
       this.applyFullscreenChrome(Boolean(enabled));
     };
-
-    (
-      window as Window & {
-        __SEE_SYNC_PRESENTATION_MODE__?: (enabled: boolean) => void;
-        __SEE_OPEN_DROPPED_PATHS__?: (paths: string[]) => void;
-      }
-    ).__SEE_OPEN_DROPPED_PATHS__ = (paths: string[]) => {
+    win.__SEE_OPEN_DROPPED_PATHS__ = (paths: string[]) => {
       void this.handleNativeDropPaths(paths);
     };
   }
@@ -143,7 +134,7 @@ class ViewerApp {
             <button class="ghost-button" id="mode-toggle" title="Tab">长页模式</button>
             <div class="window-controls">
               <button class="window-button" id="window-minimize" title="最小化">_</button>
-              <button class="window-button" id="window-maximize" title="最大化">口</button>
+              <button class="window-button" id="window-maximize" title="最大化">□</button>
               <button class="window-button window-button--close" id="window-close" title="关闭">×</button>
             </div>
           </div>
@@ -232,30 +223,6 @@ class ViewerApp {
     );
 
     window.addEventListener(
-      "drop",
-      this.handleDomDrop,
-      { passive: false }
-    );
-
-    document.addEventListener(
-      "dragover",
-      this.handleDomDragOver,
-      { passive: false }
-    );
-
-    document.addEventListener(
-      "drop",
-      this.handleDomDrop,
-      { passive: false }
-    );
-
-    this.root.addEventListener(
-      "dragover",
-      this.handleDomDragOver,
-      { passive: false }
-    );
-
-    this.root.addEventListener(
       "drop",
       this.handleDomDrop,
       { passive: false }
@@ -378,6 +345,7 @@ class ViewerApp {
     );
 
     window.addEventListener("resize", this.closeContextMenu);
+    window.addEventListener("resize", this.handleWindowResize, { passive: true });
 
     void this.appWindow.onResized(() => {
       void this.refreshWindowChrome();
@@ -432,6 +400,11 @@ class ViewerApp {
     void this.debugLog("toggle-mode", `mode=${this.mode}`);
 
     if (this.mode === "single") {
+      if (this.stripObserver) {
+        this.stripObserver.disconnect();
+        this.stripObserver = null;
+      }
+      this.stripLoadQueue = [];
       await this.renderSingleView(false);
       return;
     }
@@ -531,6 +504,7 @@ class ViewerApp {
   }
 
   private async renderSingleView(resetScale: boolean) {
+    this.isPanningImage = false;
     const viewport = this.getViewport();
     const imagePath = this.currentPath();
     if (!imagePath) {
@@ -592,7 +566,7 @@ class ViewerApp {
     };
 
     image.onerror = () => {
-      void this.handleSingleImageError(image, imagePath);
+      this.handleSingleImageError(imagePath);
     };
     image.onload = applyLoadedLayout;
     image.src = imageSrc;
@@ -717,8 +691,6 @@ class ViewerApp {
       this.pinchCenter = null;
     });
 
-    window.removeEventListener("resize", this.handleWindowResize);
-    window.addEventListener("resize", this.handleWindowResize, { passive: true });
     this.preloadNearby();
   }
 
@@ -1035,20 +1007,8 @@ class ViewerApp {
     return src;
   }
 
-  private async handleSingleImageError(image: HTMLImageElement, imagePath: string) {
-    void this.debugLog("image-error", JSON.stringify({ imagePath, currentSrc: image.currentSrc || image.src }));
-
-    if (!this.imageFallbacks.has(imagePath)) {
-      this.imageFallbacks.add(imagePath);
-      try {
-        const dataUrl = await invoke<string>("read_image_data_url", { path: imagePath });
-        void this.debugLog("image-fallback", JSON.stringify({ imagePath, mode: "data-url" }));
-        image.src = dataUrl;
-        return;
-      } catch (error) {
-        void this.debugLog("image-fallback-error", JSON.stringify({ imagePath, error: String(error) }));
-      }
-    }
+  private handleSingleImageError(imagePath: string) {
+    void this.debugLog("image-error", JSON.stringify({ imagePath }));
 
     this.getViewport().innerHTML = `
       <section class="empty-state">
@@ -1091,6 +1051,7 @@ class ViewerApp {
 
   private async toggleMaximize() {
     await invoke("toggle_maximize_window");
+    void this.refreshWindowChrome();
   }
 
   private handleDomDrop = async (event: DragEvent) => {
@@ -1115,7 +1076,7 @@ class ViewerApp {
 
   private async handleNativeDropPaths(paths: string[]) {
     void this.debugLog("native-drop", JSON.stringify(paths));
-    const firstImagePath = paths.find((path) => IMAGE_EXTENSION_PATTERN.test(path));
+    const firstImagePath = paths.find((path) => IMAGE_EXTENSION_PATTERN.test(path)) ?? paths[0];
     if (!firstImagePath) {
       this.root.querySelector<HTMLDivElement>("#statusbar")!.textContent =
         "拖入的文件里没有可打开的图片格式。";
@@ -1135,6 +1096,13 @@ class ViewerApp {
     const filePath = (imageFile as File & { path?: string } | undefined)?.path;
     if (filePath) {
       return this.normalizeInputPath(filePath);
+    }
+
+    if (files.length > 0) {
+      const anyFilePath = (files[0] as File & { path?: string })?.path;
+      if (anyFilePath) {
+        return this.normalizeInputPath(anyFilePath);
+      }
     }
 
     const uriList = event.dataTransfer?.getData("text/uri-list")?.trim();
@@ -1228,12 +1196,6 @@ class ViewerApp {
 
     this.scaleMode = "custom";
     this.scale = clampedScale;
-    this.applySingleImageTransform();
-  }
-
-  private panBy(deltaX: number, deltaY: number) {
-    this.panX -= deltaX;
-    this.panY -= deltaY;
     this.applySingleImageTransform();
   }
 
@@ -1483,6 +1445,13 @@ class ViewerApp {
     try {
       const isFullscreen = await invoke<boolean>("is_presentation_mode");
       this.applyFullscreenChrome(isFullscreen);
+
+      const maxBtn = this.root.querySelector<HTMLButtonElement>("#window-maximize");
+      if (maxBtn) {
+        const isMax = await this.appWindow.isMaximized();
+        maxBtn.textContent = isMax ? "❐" : "□";
+        maxBtn.title = isMax ? "还原" : "最大化";
+      }
     } catch (error) {
       void this.debugLog("refresh-window-chrome-error", String(error));
     }
@@ -1724,10 +1693,12 @@ class ViewerApp {
     this.cache.delete(targetPath);
     this.renderedStrip.delete(targetPath);
     this.loadingStrip.delete(targetPath);
-    this.imageFallbacks.delete(targetPath);
 
     // Remove from image list
     this.payload.images.splice(targetIndex, 1);
+    this.stripLoadQueue = this.stripLoadQueue
+      .filter((idx) => idx !== targetIndex)
+      .map((idx) => (idx > targetIndex ? idx - 1 : idx));
 
     const actionLabel = permanently ? "彻底删除" : "移至回收站";
 

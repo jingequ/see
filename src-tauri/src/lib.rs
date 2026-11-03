@@ -1,5 +1,4 @@
 use std::{
-  collections::HashSet,
   fs,
   io::Write,
   path::{Path, PathBuf},
@@ -226,7 +225,7 @@ fn get_startup_payload(state: State<'_, StartupPath>) -> Result<ViewerPayload, S
     .clone();
 
   append_native_log("get_startup_payload", &format!("startup_path={startup_path:?}"));
-  Ok(build_payload(startup_path.and_then(|path| resolve_input_path(path))))
+  Ok(build_payload(startup_path.and_then(resolve_input_path)))
 }
 
 #[tauri::command]
@@ -434,38 +433,35 @@ fn strip_windows_verbatim_prefix(path: &str) -> String {
 }
 
 fn mime_from_path(path: &Path) -> &'static str {
-  match path
-    .extension()
-    .and_then(|ext| ext.to_str())
-    .map(|ext| ext.to_ascii_lowercase())
-    .as_deref()
-  {
-    Some("jpg") | Some("jpeg") => "image/jpeg",
-    Some("png") => "image/png",
-    Some("bmp") => "image/bmp",
-    Some("gif") => "image/gif",
-    Some("webp") => "image/webp",
-    Some("tif") | Some("tiff") => "image/tiff",
-    Some("ico") => "image/x-icon",
-    Some("svg") => "image/svg+xml",
-    Some("heic") => "image/heic",
-    _ => "application/octet-stream",
+  let ext = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
+  if ext.eq_ignore_ascii_case("jpg") || ext.eq_ignore_ascii_case("jpeg") {
+    "image/jpeg"
+  } else if ext.eq_ignore_ascii_case("png") {
+    "image/png"
+  } else if ext.eq_ignore_ascii_case("webp") {
+    "image/webp"
+  } else if ext.eq_ignore_ascii_case("gif") {
+    "image/gif"
+  } else if ext.eq_ignore_ascii_case("bmp") {
+    "image/bmp"
+  } else if ext.eq_ignore_ascii_case("svg") {
+    "image/svg+xml"
+  } else if ext.eq_ignore_ascii_case("ico") {
+    "image/x-icon"
+  } else if ext.eq_ignore_ascii_case("tif") || ext.eq_ignore_ascii_case("tiff") {
+    "image/tiff"
+  } else if ext.eq_ignore_ascii_case("heic") {
+    "image/heic"
+  } else {
+    "application/octet-stream"
   }
 }
 
 fn collect_images(directory: &Path) -> Vec<String> {
-  let supported: HashSet<&str> = SUPPORTED_EXTENSIONS.iter().copied().collect();
   let mut files: Vec<PathBuf> = match fs::read_dir(directory) {
     Ok(entries) => entries
       .filter_map(|entry| entry.ok().map(|item| item.path()))
-      .filter(|path| {
-        path.is_file()
-          && path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .map(|ext| supported.contains(ext.to_ascii_lowercase().as_str()))
-            .unwrap_or(false)
-      })
+      .filter(|path| path.is_file() && is_supported_image(path))
       .collect(),
     Err(_) => Vec::new(),
   };
@@ -688,6 +684,30 @@ mod tests {
     assert!(result.is_ok());
     assert!(!file_path.exists());
   }
+
+  #[test]
+  fn test_decode_file_url_ascii_and_utf8() {
+    let ascii_url = "file:///C:/Users/test/photo.jpg";
+    assert_eq!(
+      super::decode_file_url(ascii_url),
+      Some("C:\\Users\\test\\photo.jpg".to_string())
+    );
+
+    let chinese_url = "file:///D:/%E7%85%A7%E7%89%87/%E9%A3%8E%E6%99%AF.png";
+    assert_eq!(
+      super::decode_file_url(chinese_url),
+      Some("D:\\照片\\风景.png".to_string())
+    );
+  }
+
+  #[test]
+  fn test_is_supported_image() {
+    assert!(super::is_supported_image(std::path::Path::new("a.JPG")));
+    assert!(super::is_supported_image(std::path::Path::new("b.png")));
+    assert!(super::is_supported_image(std::path::Path::new("c.webp")));
+    assert!(!super::is_supported_image(std::path::Path::new("d.txt")));
+    assert!(!super::is_supported_image(std::path::Path::new("e.exe")));
+  }
 }
 
 pub fn run() {
@@ -740,8 +760,16 @@ pub fn run() {
 }
 
 fn resolve_input_path(path: PathBuf) -> Option<PathBuf> {
-  if path.exists() && is_supported_image(&path) {
-    return Some(path);
+  if path.exists() {
+    if is_supported_image(&path) {
+      return Some(path);
+    }
+    if path.is_dir() {
+      let images = collect_images(&path);
+      if let Some(first) = images.first() {
+        return Some(PathBuf::from(first));
+      }
+    }
   }
 
   let raw = path.to_string_lossy().trim().trim_matches('"').to_string();
@@ -751,14 +779,30 @@ fn resolve_input_path(path: PathBuf) -> Option<PathBuf> {
 
   if let Some(decoded) = decode_file_url(&raw) {
     let decoded_path = PathBuf::from(decoded);
-    if decoded_path.exists() && is_supported_image(&decoded_path) {
-      return Some(decoded_path);
+    if decoded_path.exists() {
+      if is_supported_image(&decoded_path) {
+        return Some(decoded_path);
+      }
+      if decoded_path.is_dir() {
+        let images = collect_images(&decoded_path);
+        if let Some(first) = images.first() {
+          return Some(PathBuf::from(first));
+        }
+      }
     }
   }
 
   let normalized = PathBuf::from(&raw);
-  if normalized.exists() && is_supported_image(&normalized) {
-    return Some(normalized);
+  if normalized.exists() {
+    if is_supported_image(&normalized) {
+      return Some(normalized);
+    }
+    if normalized.is_dir() {
+      let images = collect_images(&normalized);
+      if let Some(first) = images.first() {
+        return Some(PathBuf::from(first));
+      }
+    }
   }
 
   None
@@ -775,32 +819,30 @@ fn decode_file_url(raw: &str) -> Option<String> {
     body.remove(0);
   }
 
-  let mut decoded = String::with_capacity(body.len());
   let bytes = body.as_bytes();
+  let mut decoded_bytes = Vec::with_capacity(bytes.len());
   let mut index = 0;
   while index < bytes.len() {
     if bytes[index] == b'%' && index + 2 < bytes.len() {
-      let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).ok()?;
-      let value = u8::from_str_radix(hex, 16).ok()?;
-      decoded.push(value as char);
-      index += 3;
-      continue;
+      if let Ok(hex) = std::str::from_utf8(&bytes[index + 1..index + 3]) {
+        if let Ok(value) = u8::from_str_radix(hex, 16) {
+          decoded_bytes.push(value);
+          index += 3;
+          continue;
+        }
+      }
     }
 
-    decoded.push(bytes[index] as char);
+    decoded_bytes.push(bytes[index]);
     index += 1;
   }
 
-  Some(decoded)
+  String::from_utf8(decoded_bytes).ok()
 }
 
 fn is_supported_image(path: &Path) -> bool {
-  let supported: HashSet<&str> = SUPPORTED_EXTENSIONS.iter().copied().collect();
-  path
-    .extension()
-    .and_then(|ext| ext.to_str())
-    .map(|ext| supported.contains(ext.to_ascii_lowercase().as_str()))
-    .unwrap_or(false)
+  let ext = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
+  SUPPORTED_EXTENSIONS.iter().any(|supported| ext.eq_ignore_ascii_case(supported))
 }
 
 #[cfg(target_os = "windows")]
